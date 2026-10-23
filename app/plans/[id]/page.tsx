@@ -72,7 +72,7 @@ export default function PlanDetailPage({ params }: { params: { id: string } }) {
             <div className="flex justify-between gap-4 p-4">
               <dt className="text-muted">Token</dt>
               <dd className="text-right text-fg">
-                {token.data ? `${token.data.symbol} · ${token.data.name}` : "…"}
+                {token.data ? `${token.data.symbol} · ${token.data.name}` : token.error ? "Unavailable" : "…"}
                 <span className="block">
                   <AddressLink address={p.token} />
                 </span>
@@ -89,7 +89,16 @@ export default function PlanDetailPage({ params }: { params: { id: string } }) {
         <aside className="space-y-4">
           <h2 className="text-lg font-semibold text-fg">Subscribe</h2>
           {token.error ? (
-            <ErrorState error={token.error} title="Couldn't read this plan's token" onRetry={token.reload} />
+            <div role="alert" className="card space-y-3 border-warn/30 p-5 text-sm">
+              <h3 className="font-semibold text-warn">Subscribing is paused</h3>
+              <p className="text-muted">
+                This token&apos;s symbol or decimals couldn&apos;t be read, so amounts can&apos;t be shown reliably. You
+                can subscribe once the token details load.
+              </p>
+              <button type="button" onClick={token.reload} className="btn-secondary">
+                Try again
+              </button>
+            </div>
           ) : token.data ? (
             <SubscribeForm plan={p} token={token.data} />
           ) : (

@@ -1,44 +1,27 @@
 "use client";
 
 import Link from "next/link";
-import { useState, useMemo } from "react";
+import { useState } from "react";
 import { usePlans } from "@/hooks/usePlans";
-import { PlanGrid } from "@/components/plan/PlanGrid";
+import { PlanGrid, type SortBy, type SortOrder } from "@/components/plan/PlanGrid";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { ErrorState } from "@/components/ui/ErrorState";
 import { LoadingBlock } from "@/components/ui/Spinner";
 
+const SORT_OPTIONS: { value: SortBy; label: string }[] = [
+  { value: "newest", label: "Newest" },
+  { value: "price", label: "Price" },
+  { value: "interval", label: "Interval" },
+];
+
 export default function PlansPage() {
   const plans = usePlans();
-  const [searchQuery, setSearchQuery] = useState("");
-  const [selectedToken, setSelectedToken] = useState<string | null>(null);
+  const [sortBy, setSortBy] = useState<SortBy>("newest");
+  const [sortOrder, setSortOrder] = useState<SortOrder>("desc");
+  const [page, setPage] = useState(0);
 
-  // Extract unique tokens from plans for filter options
-  const availableTokens = useMemo(() => {
-    if (!plans.data) return [];
-    const tokens = new Set(plans.data.map((p) => p.token));
-    return Array.from(tokens).sort();
-  }, [plans.data]);
-
-  // Filter and search plans client-side with debouncing
-  const filteredPlans = useMemo(() => {
-    if (!plans.data) return [];
-
-    return plans.data.filter((plan) => {
-      // Token filter
-      if (selectedToken && plan.token !== selectedToken) return false;
-
-      // Search filter (case-insensitive, matches plan name or merchant address)
-      if (searchQuery.trim()) {
-        const query = searchQuery.toLowerCase();
-        const matchesName = (plan.name || "").toLowerCase().includes(query);
-        const matchesMerchant = plan.merchant.toLowerCase().includes(query);
-        if (!matchesName && !matchesMerchant) return false;
-      }
-
-      return true;
-    });
-  }, [plans.data, searchQuery, selectedToken]);
+  const pageSize = 12;
+  const totalPages = plans.data ? Math.ceil(plans.data.length / pageSize) : 0;
 
   return (
     <div className="space-y-6">
@@ -56,81 +39,84 @@ export default function PlansPage() {
         <LoadingBlock label="Loading plans" />
       ) : (
         <>
-          {/* Search and Filter Controls */}
-          <div className="space-y-4">
-            <div>
-              <label htmlFor="plan-search" className="block text-sm font-medium text-muted mb-2">
-                Search
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex items-center gap-2">
+              <label htmlFor="sort-by" className="text-sm font-medium text-muted">
+                Sort by:
               </label>
-              <input
-                id="plan-search"
-                type="text"
-                placeholder="Search by plan name or merchant address..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-fg placeholder-muted focus:border-link focus:outline-none focus:ring-1 focus:ring-link"
-              />
+              <select
+                id="sort-by"
+                value={sortBy}
+                onChange={(e) => {
+                  setSortBy(e.target.value as SortBy);
+                  setPage(0);
+                }}
+                className="rounded border border-border bg-surface px-3 py-2 text-sm text-fg focus:outline-none focus:ring-2 focus:ring-brand"
+              >
+                {SORT_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
             </div>
 
-            {/* Token Filter */}
-            {availableTokens.length > 0 && (
-              <div>
-                <label className="block text-sm font-medium text-muted mb-2">Filter by Token</label>
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    onClick={() => setSelectedToken(null)}
-                    className={`rounded-full px-3 py-1 text-sm font-medium transition-colors ${
-                      selectedToken === null
-                        ? "bg-link text-fg"
-                        : "border border-line bg-surface text-muted hover:border-link hover:text-fg"
-                    }`}
-                  >
-                    All Tokens
-                  </button>
-                  {availableTokens.map((token) => (
-                    <button
-                      key={token}
-                      onClick={() => setSelectedToken(token)}
-                      className={`rounded-full px-3 py-1 text-sm font-medium transition-colors ${
-                        selectedToken === token
-                          ? "bg-link text-fg"
-                          : "border border-line bg-surface text-muted hover:border-link hover:text-fg"
-                      }`}
-                    >
-                      {token}
-                    </button>
-                  ))}
-                </div>
+            <div className="flex items-center gap-2">
+              <label htmlFor="sort-order" className="text-sm font-medium text-muted">
+                Order:
+              </label>
+              <select
+                id="sort-order"
+                value={sortOrder}
+                onChange={(e) => setSortOrder(e.target.value as SortOrder)}
+                className="rounded border border-border bg-surface px-3 py-2 text-sm text-fg focus:outline-none focus:ring-2 focus:ring-brand"
+              >
+                <option value="asc">Ascending</option>
+                <option value="desc">Descending</option>
+              </select>
+            </div>
+
+            {plans.data.length > pageSize && (
+              <div className="ml-auto flex items-center gap-2">
+                <button
+                  onClick={() => setPage(Math.max(0, page - 1))}
+                  disabled={page === 0}
+                  className="rounded border border-border px-3 py-2 text-sm text-fg disabled:opacity-50"
+                >
+                  Previous
+                </button>
+                <span className="text-sm text-muted">
+                  Page {page + 1} of {totalPages}
+                </span>
+                <button
+                  onClick={() => setPage(Math.min(totalPages - 1, page + 1))}
+                  disabled={page >= totalPages - 1}
+                  className="rounded border border-border px-3 py-2 text-sm text-fg disabled:opacity-50"
+                >
+                  Next
+                </button>
               </div>
             )}
           </div>
 
-          {/* Results */}
-          {filteredPlans.length === 0 && plans.data.length > 0 ? (
-            <EmptyState
-              title="No plans match your search"
-              description={
-                searchQuery || selectedToken
-                  ? "Try adjusting your search or filter criteria."
-                  : "No plans available."
-              }
-            />
-          ) : (
-            <PlanGrid
-              plans={filteredPlans}
-              empty={
-                <EmptyState
-                  title="No plans yet"
-                  description="No merchant has published a plan on this network. Merchants can create one from their dashboard."
-                  action={
-                    <Link href="/merchant/plans/new" className="btn-secondary">
-                      Create a plan
-                    </Link>
-                  }
-                />
-              }
-            />
-          )}
+          <PlanGrid
+            plans={plans.data}
+            sortBy={sortBy}
+            sortOrder={sortOrder}
+            page={page}
+            pageSize={pageSize}
+            empty={
+              <EmptyState
+                title="No plans yet"
+                description="No merchant has published a plan on this network. Merchants can create one from their dashboard."
+                action={
+                  <Link href="/merchant/plans/new" className="btn-secondary">
+                    Create a plan
+                  </Link>
+                }
+              />
+            }
+          />
         </>
       )}
     </div>

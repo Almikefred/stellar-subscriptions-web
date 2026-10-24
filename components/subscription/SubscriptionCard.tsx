@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useTranslations } from "next-intl";
+import { useWallet } from "@/hooks/useWallet";
+import { useTokenBalance } from "@/hooks/useToken";
 import { describeInterval } from "@/lib/format";
 import { AddressLink } from "@/components/ui/AddressLink";
 import { TokenAmount } from "@/components/ui/TokenAmount";
@@ -17,10 +18,14 @@ import { SubStatusBadge } from "./SubStatusBadge";
  * card itself, so stopping a subscription is never more than one click away.
  */
 export function SubscriptionCard({ sub, onChanged }: { sub: Subscription; onChanged: () => void }) {
-  const t = useTranslations("SubscriptionCard");
+  const { address } = useWallet();
+  const balance = useTokenBalance(sub.token, address);
+
+  const balanceTooLow =
+    balance.data !== null && balance.data !== undefined && balance.data < sub.amountPerPeriod;
 
   return (
-    <article className="card space-y-5 p-5" aria-label={t("ariaLabel", { id: sub.id })}>
+    <article className="card space-y-5 p-5" aria-label={`Subscription ${sub.id}`}>
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div className="space-y-1">
           <h3 className="text-lg font-semibold text-fg">
@@ -28,93 +33,35 @@ export function SubscriptionCard({ sub, onChanged }: { sub: Subscription; onChan
             <span className="ml-2 text-sm font-normal text-muted">{describeInterval(sub.intervalLedgers)}</span>
           </h3>
           <p className="text-sm text-muted">
-            {t("to")} <AddressLink address={sub.merchant} />
+            to <AddressLink address={sub.merchant} />
             {sub.planId > 0 && (
               <>
                 {" "}
                 ·{" "}
                 <Link href={`/plans/${sub.planId}`} className="hover:text-fg hover:underline">
-                  {t("plan", { id: sub.planId })}
+                  plan #{sub.planId}
                 </Link>
               </>
             )}
-            <span> · {t("subscription", { id: sub.id })}</span>
+            <span> · subscription #{sub.id}</span>
           </p>
         </div>
         <SubStatusBadge status={sub.status} />
       </header>
 
+      {balanceTooLow && (
+        <div className="rounded bg-warn/10 p-3 text-sm text-warn">
+          <p className="font-medium">Insufficient balance</p>
+          <p>Your balance is too low to cover the next charge. Top up to avoid failed payments.</p>
+        </div>
+      )}
+
       <CapProgress sub={sub} />
       <NextChargeCountdown sub={sub} />
-
-      {/* What happens next explanation based on status */}
-      <div className="rounded-lg border border-line bg-raised px-3 py-2 text-sm text-muted">
-        {sub.status === "active" && "The merchant can charge once per interval, up to your cap."}
-        {sub.status === "paused" && "No charges can happen until you resume."}
-        {sub.status === "cancelled" && "Final. No further charges can ever happen."}
-        {sub.status === "exhausted" && "The full cap has been charged. No further charges are possible."}
-      </div>
-
-      {/* Links to explorer and contract events */}
-      <div className="flex flex-wrap gap-2 text-sm">
-        <a
-          href={`https://stellar.expert/explorer/testnet/contract/${sub.contractId}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-link hover:underline"
-        >
-          View on Explorer ↗
-        </a>
-        <span className="text-muted">·</span>
-        <a
-          href={`https://stellar.expert/explorer/testnet/contract/${sub.contractId}/events?search=subscription_${sub.id}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-link hover:underline"
-        >
-          View Events ↗
-        </a>
-      </div>
 
       <footer className="flex flex-wrap items-start gap-3 border-t border-line pt-4">
         <PauseResumeButton sub={sub} onDone={onChanged} />
         <CancelButton sub={sub} onDone={onChanged} />
-      </footer>
-    </article>
-  );
-}
-
-/**
- * Card-shaped placeholder shown while subscriptions load. Mirrors the layout
- * and spacing of {@link SubscriptionCard} so the grid does not shift when the
- * real data arrives. Labelled for assistive technology.
- */
-export function SubscriptionCardSkeleton() {
-  return (
-    <article
-      className="card space-y-5 p-5"
-      role="status"
-      aria-busy="true"
-      aria-label="Loading subscription"
-    >
-      <header className="flex flex-wrap items-start justify-between gap-3">
-        <div className="space-y-1">
-          <div className="h-6 w-40 animate-pulse rounded bg-line" />
-          <div className="h-4 w-56 animate-pulse rounded bg-line" />
-        </div>
-        <div className="h-6 w-20 animate-pulse rounded-full bg-line" />
-      </header>
-
-      <div className="space-y-2">
-        <div className="h-2 w-full animate-pulse rounded-full bg-line" />
-        <div className="h-4 w-32 animate-pulse rounded bg-line" />
-      </div>
-
-      <div className="h-4 w-48 animate-pulse rounded bg-line" />
-
-      <footer className="flex flex-wrap items-start gap-3 border-t border-line pt-4">
-        <div className="h-9 w-24 animate-pulse rounded bg-line" />
-        <div className="h-9 w-24 animate-pulse rounded bg-line" />
       </footer>
     </article>
   );

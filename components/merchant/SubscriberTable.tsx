@@ -1,323 +1,170 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
-import ChargeButton from './ChargeButton';
+import { useCallback, useMemo } from 'react';
 
-export type SubscriptionStatus = 'active' | 'paused' | 'cancelled' | 'exhausted';
-
-export interface SubscriberSubscription {
-  id: string;
-  subscriber: string;
-  amount: number;
-  nextChargeLedger: number;
-  status: SubscriptionStatus;
-  planId?: string | number | null;
-  planName?: string | null;
+export interface Subscriber {
+  address: string;
+  tokenSymbol: string;
+  tokenAddress: string;
+  /** Raw amount as a bigint (or its exact decimal string) — never a float. */
+  rawAmount: bigint | string;
+  /** Number of decimals for the token, used to format the display amount. */
+  decimals: number;
+  status: string;
 }
 
 interface SubscriberTableProps {
-  subscriptions: SubscriberSubscription[];
-  onReload?: () => void;
+  subscribers: Subscriber[];
+  /** Optional filename for the CSV download. */
+  fileName?: string;
 }
 
-type StatusFilter = 'all' | SubscriptionStatus;
-type SortKey = 'subscriber' | 'amount' | 'nextChargeLedger' | 'status' | 'plan';
-type SortDirection = 'asc' | 'desc';
+/**
+ * Format a raw integer amount (bigint or decimal string) into a human-readable
+ * decimal string using the token's decimals. Uses pure string manipulation so
+ * there is no floating-point rounding.
+ */
+function formatAmount(rawAmount: bigint | string, decimals: number): string {
+  const raw = typeof rawAmount === 'bigint' ? rawAmount.toString() : rawAmount.trim();
 
-interface SortState {
-  key: SortKey;
-  direction: SortDirection;
-}
+  // Handle optional sign.
+  const negative = raw.startsWith('-');
+  const digits = negative ? raw.slice(1) : raw;
 
-const STATUS_FILTERS: { value: StatusFilter; label: string }[] = [
-  { value: 'all', label: 'All' },
-  { value: 'active', label: 'Active' },
-  { value: 'paused', label: 'Paused' },
-  { value: 'cancelled', label: 'Cancelled' },
-  { value: 'exhausted', label: 'Exhausted' },
-];
-
-const SORT_KEYS: SortKey[] = ['subscriber', 'amount', 'nextChargeLedger', 'status', 'plan'];
-
-function isStatusFilter(value: string | null): value is StatusFilter {
-  return value !== null && STATUS_FILTERS.some((f) => f.value === value);
-}
-
-function isSortKey(value: string | null): value is SortKey {
-  return value !== null && (SORT_KEYS as string[]).includes(value);
-}
-
-function isSortDirection(value: string | null): value is SortDirection {
-  return value === 'asc' || value === 'desc';
-}
-
-function planLabel(sub: SubscriberSubscription): string {
-  if (sub.planName) return sub.planName;
-  if (sub.planId !== undefined && sub.planId !== null && sub.planId !== '') {
-    return `Plan #${sub.planId}`;
+  // Guard against non-numeric input.
+  if (!/^\d+$/.test(digits)) {
+    return raw;
   }
-  return 'No plan';
-}
 
-function planKey(sub: SubscriberSubscription): string {
-  if (sub.planId !== undefined && sub.planId !== null && sub.planId !== '') {
-    return String(sub.planId);
+  if (decimals <= 0) {
+    return `${negative ? '-' : ''}${digits}`;
   }
-  return '__none__';
+
+  const padded = digits.padStart(decimals + 1, '0');
+  const integerPart = padded.slice(0, padded.length - decimals);
+  const fractionalPart = padded.slice(padded.length - decimals).replace(/0+$/, '');
+
+  const sign = negative ? '-' : '';
+  return fractionalPart.length > 0
+    ? `${sign}${integerPart}.${fractionalPart}`
+    : `${sign}${integerPart}`;
 }
 
-function statusText(sub: SubscriberSubscription): string {
-  switch (sub.status) {
-    case 'active':
-      return `Active — not due until ledger ${sub.nextChargeLedger}`;
-    case 'paused':
-      return 'Paused — no charges will be made';
-    case 'cancelled':
-      return 'Cancelled — no further charges';
-    case 'exhausted':
-      return 'Cap reached — no further charges allowed';
-    default:
-      return '';
+/** Escape a single CSV field per RFC 4180. */
+function escapeCsvField(value: string): string {
+  if (/[",\r\n]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
   }
+  return value;
 }
 
-function formatAmount(amount: number): string {
-  return amount.toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+function buildCsv(subscribers: Subscriber[]): string {
+  const header = [
+    'Subscriber Address',
+    'Token Symbol',
+    'Token Address',
+    'Raw Amount',
+    'Formatted Amount',
+    'Status',
+  ];
+
+  const rows = subscribers.map((subscriber) => {
+    const raw =
+      typeof subscriber.rawAmount === 'bigint'
+        ? subscriber.rawAmount.toString()
+        : subscriber.rawAmount.trim();
+    const formatted = `${formatAmount(subscriber.rawAmount, subscriber.decimals)} ${subscriber.tokenSymbol}`;
+
+    return [
+      subscriber.address,
+      subscriber.tokenSymbol,
+      subscriber.tokenAddress,
+      raw,
+      formatted,
+      subscriber.status,
+    ];
   });
+
+  return [header, ...rows]
+    .map((row) => row.map((field) => escapeCsvField(String(field))).join(','))
+    .join('\r\n');
 }
 
-export default function SubscriberTable({ subscriptions, onReload }: SubscriberTableProps) {
-  const router = useRouter();
-  const searchParams = useSearchParams();
+export default function SubscriberTable({ subscribers, fileName = 'subscribers.csv' }: SubscriberTableProps) {
+  const rows = useMemo(
+    () =>
+      subscribers.map((subscriber) => ({
+        ...subscriber,
+        rawDisplay:
+          typeof subscriber.rawAmount === 'bigint'
+            ? subscriber.rawAmount.toString()
+            : subscriber.rawAmount,
+        formattedDisplay: `${formatAmount(subscriber.rawAmount, subscriber.decimals)} ${subscriber.tokenSymbol}`,
+      })),
+    [subscribers],
+  );
 
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-  const [planFilter, setPlanFilter] = useState<string>('all');
-  const [sort, setSort] = useState<SortState>({ key: 'subscriber', direction: 'asc' });
-  const [initialized, setInitialized] = useState(false);
+  const handleDownloadCsv = useCallback(() => {
+    const csv = buildCsv(subscribers);
+    // Prepend a BOM so spreadsheet apps detect UTF-8 correctly.
+    const blob = new Blob(['\uFEFF', csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
 
-  // Initialize state from the URL on mount.
-  useEffect(() => {
-    const urlStatus = searchParams.get('status');
-    const urlPlan = searchParams.get('plan');
-    const urlSortKey = searchParams.get('sort');
-    const urlSortDir = searchParams.get('dir');
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
 
-    if (isStatusFilter(urlStatus)) {
-      setStatusFilter(urlStatus);
-    }
-    if (urlPlan !== null && urlPlan !== '') {
-      setPlanFilter(urlPlan);
-    }
-    if (isSortKey(urlSortKey)) {
-      setSort({
-        key: urlSortKey,
-        direction: isSortDirection(urlSortDir) ? urlSortDir : 'asc',
-      });
-    }
-    setInitialized(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Persist filter and sort selections in the URL.
-  useEffect(() => {
-    if (!initialized) return;
-
-    const params = new URLSearchParams(Array.from(searchParams.entries()));
-
-    if (statusFilter === 'all') {
-      params.delete('status');
-    } else {
-      params.set('status', statusFilter);
-    }
-
-    if (planFilter === 'all') {
-      params.delete('plan');
-    } else {
-      params.set('plan', planFilter);
-    }
-
-    if (sort.key === 'subscriber' && sort.direction === 'asc') {
-      params.delete('sort');
-      params.delete('dir');
-    } else {
-      params.set('sort', sort.key);
-      params.set('dir', sort.direction);
-    }
-
-    const nextQuery = params.toString();
-    const currentQuery = searchParams.toString();
-
-    if (nextQuery !== currentQuery) {
-      router.replace(nextQuery ? `?${nextQuery}` : '?', { scroll: false });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter, planFilter, sort, initialized]);
-
-  const planOptions = useMemo(() => {
-    const seen = new Map<string, string>();
-    for (const sub of subscriptions) {
-      const key = planKey(sub);
-      if (!seen.has(key)) {
-        seen.set(key, planLabel(sub));
-      }
-    }
-    return Array.from(seen.entries())
-      .map(([value, label]) => ({ value, label }))
-      .sort((a, b) => a.label.localeCompare(b.label));
-  }, [subscriptions]);
-
-  const visibleRows = useMemo(() => {
-    const filtered = subscriptions.filter((sub) => {
-      if (statusFilter !== 'all' && sub.status !== statusFilter) return false;
-      if (planFilter !== 'all' && planKey(sub) !== planFilter) return false;
-      return true;
-    });
-
-    const sorted = [...filtered].sort((a, b) => {
-      let cmp = 0;
-      switch (sort.key) {
-        case 'subscriber':
-          cmp = a.subscriber.localeCompare(b.subscriber);
-          break;
-        case 'amount':
-          cmp = a.amount - b.amount;
-          break;
-        case 'nextChargeLedger':
-          cmp = a.nextChargeLedger - b.nextChargeLedger;
-          break;
-        case 'status':
-          cmp = a.status.localeCompare(b.status);
-          break;
-        case 'plan':
-          cmp = planLabel(a).localeCompare(planLabel(b));
-          break;
-        default:
-          cmp = 0;
-      }
-      return sort.direction === 'asc' ? cmp : -cmp;
-    });
-
-    return sorted;
-  }, [subscriptions, statusFilter, planFilter, sort]);
-
-  const toggleSort = useCallback((key: SortKey) => {
-    setSort((prev) => {
-      if (prev.key === key) {
-        return { key, direction: prev.direction === 'asc' ? 'desc' : 'asc' };
-      }
-      return { key, direction: 'asc' };
-    });
-  }, []);
-
-  const sortIndicator = (key: SortKey) => {
-    if (sort.key !== key) return '';
-    return sort.direction === 'asc' ? ' ▲' : ' ▼';
-  };
-
-  const handleReload = useCallback(() => {
-    if (onReload) onReload();
-  }, [onReload]);
-
-  const filtersActive = statusFilter !== 'all' || planFilter !== 'all';
+    URL.revokeObjectURL(url);
+  }, [subscribers, fileName]);
 
   return (
-    <div className="subscriber-table">
-      <div className="subscriber-table__filters">
-        <label className="subscriber-table__filter">
-          <span>Status</span>
-          <select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
-          >
-            {STATUS_FILTERS.map((f) => (
-              <option key={f.value} value={f.value}>
-                {f.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="subscriber-table__filter">
-          <span>Plan</span>
-          <select value={planFilter} onChange={(e) => setPlanFilter(e.target.value)}>
-            <option value="all">All</option>
-            {planOptions.map((p) => (
-              <option key={p.value} value={p.value}>
-                {p.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        {onReload ? (
-          <button type="button" className="subscriber-table__reload" onClick={handleReload}>
-            Reload
-          </button>
-        ) : null}
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '0.75rem' }}>
+        <button type="button" onClick={handleDownloadCsv} disabled={subscribers.length === 0}>
+          Download CSV
+        </button>
       </div>
 
-      {visibleRows.length === 0 ? (
-        <p className="subscriber-table__empty">
-          {filtersActive
-            ? 'No subscribers match the selected filters.'
-            : 'No subscribers yet.'}
-        </p>
-      ) : (
-        <table className="subscriber-table__table">
-          <thead>
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Subscriber</th>
+            <th scope="col">Token</th>
+            <th scope="col">Token Address</th>
+            <th scope="col">Raw Amount</th>
+            <th scope="col">Formatted Amount</th>
+            <th scope="col">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 ? (
             <tr>
-              <th>
-                <button type="button" onClick={() => toggleSort('subscriber')}>
-                  Subscriber{sortIndicator('subscriber')}
-                </button>
-              </th>
-              <th>
-                <button type="button" onClick={() => toggleSort('amount')}>
-                  Amount{sortIndicator('amount')}
-                </button>
-              </th>
-              <th>
-                <button type="button" onClick={() => toggleSort('nextChargeLedger')}>
-                  Next charge ledger{sortIndicator('nextChargeLedger')}
-                </button>
-              </th>
-              <th>
-                <button type="button" onClick={() => toggleSort('status')}>
-                  Status{sortIndicator('status')}
-                </button>
-              </th>
-              <th>
-                <button type="button" onClick={() => toggleSort('plan')}>
-                  Plan{sortIndicator('plan')}
-                </button>
-              </th>
-              <th>Action</th>
+              <td colSpan={6}>No subscribers yet.</td>
             </tr>
-          </thead>
-          <tbody>
-            {visibleRows.map((sub) => (
-              <tr key={sub.id}>
-                <td>{sub.subscriber}</td>
-                <td>{formatAmount(sub.amount)}</td>
-                <td>{sub.nextChargeLedger}</td>
+          ) : (
+            rows.map((row) => (
+              <tr key={`${row.address}-${row.tokenAddress}`}>
                 <td>
-                  <span className={`subscriber-table__status subscriber-table__status--${sub.status}`}>
-                    {sub.status}
-                  </span>
-                  <span className="subscriber-table__status-detail">{statusText(sub)}</span>
+                  <code>{row.address}</code>
                 </td>
-                <td>{planLabel(sub)}</td>
+                <td>{row.tokenSymbol}</td>
                 <td>
-                  <ChargeButton subscriptionId={sub.id} disabled={sub.status !== 'active'} />
+                  <code>{row.tokenAddress}</code>
                 </td>
+                <td>
+                  <code>{row.rawDisplay}</code>
+                </td>
+                <td>{row.formattedDisplay}</td>
+                <td>{row.status}</td>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+            ))
+          )}
+        </tbody>
+      </table>
     </div>
   );
 }

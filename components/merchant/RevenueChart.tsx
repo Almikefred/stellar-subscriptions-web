@@ -1,328 +1,356 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
+import { useAsync } from '@/lib/hooks/useAsync';
+import { getChargeEvents, getTokenInfo, type ChargeEvent } from '@/lib/contracts';
+import { formatAmount } from '@/lib/format';
+import { LoadingBlock } from '@/components/ui/LoadingBlock';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { ErrorState } from '@/components/ui/ErrorState';
 
-export interface ChargeEvent {
-  id?: string;
-  ledger: number;
-  timestamp: number | string;
-  subscriptionId: string;
-  token: string;
-  amount: string | number;
-  txHash: string;
-}
-
-export interface MerchantSubscription {
-  id: string;
-  planId?: string | null;
-}
-
-export interface MerchantPlan {
-  id: string;
-  name: string;
-}
+/**
+ * Estimated average ledger close time in seconds (Stellar: ~5s).
+ * Used only to derive an approximate date for the history window.
+ */
+const SECONDS_PER_LEDGER = 5;
 
 export interface RevenueChartProps {
-  chargeEvents: ChargeEvent[];
-  subscriptions: MerchantSubscription[];
-  plans: MerchantPlan[];
-  explorerUrl?: (txHash: string) => string;
-  className?: string;
+  network: string;
+  merchant: string;
 }
 
-interface PlanTokenAggregate {
-  planId: string;
-  planName: string;
-  token: string;
-  total: number;
-  count: number;
+interface TokenInfo {
+  address: string;
+  symbol: string;
+  decimals: number;
 }
 
-const NO_PLAN_KEY = '__no_plan__';
-const NO_PLAN_LABEL = 'No plan';
-
-function toNumber(value: string | number): number {
-  const n = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(n) ? n : 0;
+interface DayBucket {
+  /** UTC day key, e.g. "2024-05-01" */
+  day: string;
+  /** Raw amount as bigint, summed strictly within one token */
+  amount: bigint;
 }
 
-function formatAmount(value: number): string {
-  if (!Number.isFinite(value)) return '0';
-  return value.toLocaleString(undefined, { maximumFractionDigits: 7 });
+interface TokenSeries {
+  token: TokenInfo;
+  buckets: DayBucket[];
+  total: bigint;
 }
 
-function formatTimestamp(value: number | string): string {
-  let date: Date;
-  if (typeof value === 'number') {
-    // Heuristic: values below ~year 2001 in ms are likely seconds.
-    const ms = value < 1e12 ? value * 1000 : value;
-    date = new Date(ms);
-  } else {
-    const parsed = new Date(value);
-    if (!Number.isNaN(parsed.getTime())) {
-      date = parsed;
-    } else {
-      const numeric = Number(value);
-      date = new Date(numeric < 1e12 ? numeric * 1000 : numeric);
-    }
+function utcDayKey(timestampSeconds: number): string {
+  const d = new Date(timestampSeconds * 1000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function estimateLedgerDate(fromLedger: number, currentLedger: number): Date | null {
+  if (!Number.isFinite(fromLedger) || !Number.isFinite(currentLedger)) {
+    return null;
   }
-  if (Number.isNaN(date.getTime())) return String(value);
-  return date.toISOString();
+  const ledgersAgo = Math.max(0, currentLedger - fromLedger);
+  const secondsAgo = ledgersAgo * SECONDS_PER_LEDGER;
+  return new Date(Date.now() - secondsAgo * 1000);
 }
 
-function escapeCsv(value: string): string {
-  if (/[",\n\r]/.test(value)) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
+function formatEstimate(date: Date | null): string {
+  if (!date) return 'unknown';
+  return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 }
 
-export default function RevenueChart({
-  chargeEvents,
-  subscriptions,
-  plans,
-  explorerUrl,
-  className,
-}: RevenueChartProps) {
-  const [exporting, setExporting] = useState(false);
+export function RevenueChart({ network, merchant }: RevenueChartProps) {
+  const {
+    data: chargeResult,
+    loading,
+    error,
+  } = useAsync(
+    () => getChargeEvents(network, merchant),
+    [network, merchant],
+  );
 
-  const subscriptionToPlan = useMemo(() => {
-    const map = new Map<string, string | null>();
-    for (const sub of subscriptions) {
-      map.set(sub.id, sub.planId ?? null);
+  const events: ChargeEvent[] = chargeResult?.events ?? [];
+  const fromLedger: number | undefined = chargeResult?.fromLedger;
+  const currentLedger: number | undefined = chargeResult?.currentLedger;
+
+  // Distinct token addresses, strictly grouped.
+  const tokenAddresses = useMemo(() => {
+    const set = new Set<string>();
+    for (const ev of events) {
+      set.add(ev.token);
     }
-    return map;
-  }, [subscriptions]);
+    return Array.from(set).sort();
+  }, [events]);
 
-  const planNames = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const plan of plans) {
-      map.set(plan.id, plan.name);
-    }
-    return map;
-  }, [plans]);
-
-  const { perPlan, perTokenTotals, grandTotal } = useMemo(() => {
-    const aggregate = new Map<string, PlanTokenAggregate>();
-    const tokenTotals = new Map<string, number>();
-    let total = 0;
-
-    for (const event of chargeEvents) {
-      const amount = toNumber(event.amount);
-      const token = event.token || 'UNKNOWN';
-      const planId = subscriptionToPlan.get(event.subscriptionId) ?? null;
-      const bucketKey = planId ?? NO_PLAN_KEY;
-      const planName = planId ? planNames.get(planId) ?? planId : NO_PLAN_LABEL;
-
-      const key = `${bucketKey}::${token}`;
-      const existing = aggregate.get(key);
-      if (existing) {
-        existing.total += amount;
-        existing.count += 1;
-      } else {
-        aggregate.set(key, {
-          planId: bucketKey,
-          planName,
-          token,
-          total: amount,
-          count: 1,
-        });
-      }
-
-      tokenTotals.set(token, (tokenTotals.get(token) ?? 0) + amount);
-      total += amount;
-    }
-
-    const rows = Array.from(aggregate.values()).sort((a, b) => {
-      if (a.planId === NO_PLAN_KEY && b.planId !== NO_PLAN_KEY) return 1;
-      if (b.planId === NO_PLAN_KEY && a.planId !== NO_PLAN_KEY) return -1;
-      if (a.planName !== b.planName) return a.planName.localeCompare(b.planName);
-      return a.token.localeCompare(b.token);
-    });
-
-    return {
-      perPlan: rows,
-      perTokenTotals: Array.from(tokenTotals.entries()).sort((a, b) =>
-        a[0].localeCompare(b[0]),
-      ),
-      grandTotal: total,
-    };
-  }, [chargeEvents, subscriptionToPlan, planNames]);
-
-  const ledgerRange = useMemo(() => {
-    if (chargeEvents.length === 0) return null;
-    let min = Infinity;
-    let max = -Infinity;
-    for (const event of chargeEvents) {
-      if (typeof event.ledger === 'number' && Number.isFinite(event.ledger)) {
-        if (event.ledger < min) min = event.ledger;
-        if (event.ledger > max) max = event.ledger;
-      }
-    }
-    if (min === Infinity || max === -Infinity) return null;
-    return { min, max };
-  }, [chargeEvents]);
-
-  const handleExport = () => {
-    if (exporting) return;
-    setExporting(true);
-    try {
-      const lines: string[] = [];
-      const rangeText = ledgerRange
-        ? `ledger ${ledgerRange.min} to ${ledgerRange.max}`
-        : 'no ledger range (no charge events)';
-      lines.push(`# Charge history export - ${rangeText}`);
-      lines.push(
-        ['ledger', 'timestamp', 'subscription_id', 'token', 'amount', 'tx_hash', 'tx_url']
-          .map(escapeCsv)
-          .join(','),
+  const {
+    data: tokenInfos,
+    loading: tokensLoading,
+    error: tokensError,
+  } = useAsync(
+    async () => {
+      const infos = await Promise.all(
+        tokenAddresses.map(async (address) => {
+          const info = await getTokenInfo(network, address);
+          return {
+            address,
+            symbol: info.symbol,
+            decimals: info.decimals,
+          } satisfies TokenInfo;
+        }),
       );
+      return infos;
+    },
+    [network, tokenAddresses.join(',')],
+  );
 
-      const sorted = [...chargeEvents].sort((a, b) => {
-        if (a.ledger !== b.ledger) return a.ledger - b.ledger;
-        return formatTimestamp(a.timestamp).localeCompare(formatTimestamp(b.timestamp));
-      });
-
-      for (const event of sorted) {
-        const url = explorerUrl ? explorerUrl(event.txHash) : '';
-        lines.push(
-          [
-            String(event.ledger),
-            formatTimestamp(event.timestamp),
-            event.subscriptionId,
-            event.token,
-            String(event.amount),
-            event.txHash,
-            url,
-          ]
-            .map((v) => escapeCsv(v))
-            .join(','),
-        );
-      }
-
-      const csv = lines.join('\r\n');
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      const objectUrl = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      const rangeSuffix = ledgerRange
-        ? `ledger-${ledgerRange.min}-${ledgerRange.max}`
-        : 'no-ledger-range';
-      link.href = objectUrl;
-      link.download = `charge-history-${rangeSuffix}.csv`;
-      link.style.display = 'none';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(objectUrl);
-    } finally {
-      setExporting(false);
+  const series: TokenSeries[] = useMemo(() => {
+    if (!tokenInfos) return [];
+    const infoByAddress = new Map<string, TokenInfo>();
+    for (const info of tokenInfos) {
+      infoByAddress.set(info.address, info);
     }
-  };
 
-  return (
-    <div className={className}>
-      <div
-        style={{
-          display: 'flex',
-          gap: '1.5rem',
-          alignItems: 'flex-start',
-          flexWrap: 'wrap',
-        }}
-      >
-        <div style={{ flex: '1 1 320px', minWidth: 0 }}>
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              gap: '0.75rem',
-              marginBottom: '0.75rem',
-            }}
-          >
-            <h3 style={{ margin: 0 }}>Revenue</h3>
-            <button
-              type="button"
-              onClick={handleExport}
-              disabled={exporting || chargeEvents.length === 0}
-              aria-label="Export charge history to CSV"
-            >
-              {exporting ? 'Exporting…' : 'Export CSV'}
-            </button>
-          </div>
-          <p style={{ margin: '0 0 0.75rem', fontSize: '0.875rem', opacity: 0.8 }}>
-            {ledgerRange
-              ? `Ledger range: ${ledgerRange.min} – ${ledgerRange.max}`
-              : 'No charge events loaded.'}
-          </p>
-          <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-            {perTokenTotals.length === 0 ? (
-              <li style={{ opacity: 0.7 }}>No revenue recorded.</li>
-            ) : (
-              perTokenTotals.map(([token, total]) => (
-                <li key={token} style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span>{token}</span>
-                  <strong>{formatAmount(total)}</strong>
-                </li>
-              ))
-            )}
-          </ul>
-        </div>
+    // Group events strictly by token address.
+    const byToken = new Map<string, Map<string, bigint>>();
+    for (const ev of events) {
+      const day = utcDayKey(ev.timestamp);
+      let days = byToken.get(ev.token);
+      if (!days) {
+        days = new Map<string, bigint>();
+        byToken.set(ev.token, days);
+      }
+      const prev = days.get(day) ?? 0n;
+      days.set(day, prev + ev.amount);
+    }
 
-        <div style={{ flex: '1 1 320px', minWidth: 0 }}>
-          <h3 style={{ margin: '0 0 0.75rem' }}>Revenue by plan</h3>
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem' }}>Plan</th>
-                <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem' }}>Token</th>
-                <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem' }}>Charges</th>
-                <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem' }}>Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {perPlan.length === 0 ? (
-                <tr>
-                  <td colSpan={4} style={{ padding: '0.5rem', opacity: 0.7 }}>
-                    No charges to attribute.
-                  </td>
-                </tr>
-              ) : (
-                perPlan.map((row) => (
-                  <tr key={`${row.planId}::${row.token}`}>
-                    <td style={{ padding: '0.25rem 0.5rem' }}>
-                      {row.planId === NO_PLAN_KEY ? (
-                        <em>{NO_PLAN_LABEL}</em>
-                      ) : (
-                        row.planName
-                      )}
-                    </td>
-                    <td style={{ padding: '0.25rem 0.5rem' }}>{row.token}</td>
-                    <td style={{ padding: '0.25rem 0.5rem', textAlign: 'right' }}>
-                      {row.count}
-                    </td>
-                    <td style={{ padding: '0.25rem 0.5rem', textAlign: 'right' }}>
-                      {formatAmount(row.total)}
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-            <tfoot>
-              <tr>
-                <td colSpan={3} style={{ padding: '0.25rem 0.5rem', textAlign: 'right' }}>
-                  <strong>Total</strong>
-                </td>
-                <td style={{ padding: '0.25rem 0.5rem', textAlign: 'right' }}>
-                  <strong>{formatAmount(grandTotal)}</strong>
-                </td>
-              </tr>
-            </tfoot>
-          </table>
-          <p style={{ margin: '0.5rem 0 0', fontSize: '0.75rem', opacity: 0.7 }}>
-            Charges for subscriptions without a plan are listed under “{NO_PLAN_LABEL}”.
-          </p>
-        </div>
-      </div>
+    const result: TokenSeries[] = [];
+    for (const [address, days] of byToken) {
+      const info = infoByAddress.get(address);
+      if (!info) continue;
+      const buckets: DayBucket[] = Array.from(days.entries())
+        .map(([day, amount]) => ({ day, amount }))
+        .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+      const total = buckets.reduce((acc, b) => acc + b.amount, 0n);
+      result.push({ token: info, buckets, total });
+    }
+    result.sort((a, b) => (a.token.symbol < b.token.symbol ? -1 : 1));
+    return result;
+  }, [events, tokenInfos]);
+
+  // Union of all days across tokens, for the shared X axis.
+  const allDays = useMemo(() => {
+    const set = new Set<string>();
+    for (const s of series) {
+      for (const b of s.buckets) set.add(b.day);
+    }
+    return Array.from(set).sort();
+  }, [series]);
+
+  // Chart data: one row per day, one key per token (never summed together).
+  const chartData = useMemo(() => {
+    return allDays.map((day) => {
+      const row: Record<string, string | number> = { day };
+      for (const s of series) {
+        const bucket = s.buckets.find((b) => b.day === day);
+        row[s.token.address] = bucket
+          ? Number(formatAmount(bucket.amount, s.token.decimals, { plain: true }))
+          : 0;
+      }
+      return row;
+    });
+  }, [allDays, series]);
+
+  const isLoading = loading || tokensLoading;
+  const anyError = error ?? tokensError;
+
+  const estimatedDate = useMemo(() => {
+    if (fromLedger === undefined || currentLedger === undefined) return null;
+    return estimateLedgerDate(fromLedger, currentLedger);
+  }, [fromLedger, currentLedger]);
+
+  const historyNotice = (
+    <div
+      role="note"
+      className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900"
+    >
+      <p className="font-medium">Charge history covers only recent ledgers.</p>
+      <p className="mt-1">
+        Data starts from ledger{' '}
+        <span className="font-mono">
+          {fromLedger !== undefined ? fromLedger.toLocaleString() : 'unknown'}
+        </span>
+        {estimatedDate ? (
+          <>
+            {' '}
+            (estimated start date:{' '}
+            <span className="font-mono">{formatEstimate(estimatedDate)}</span> — this
+            date is an estimate based on average ledger close times, not an exact
+            timestamp)
+          </>
+        ) : null}
+        . RPC nodes keep only a limited window of events, so an empty or partial chart
+        does not mean there was no revenue. Older history requires an indexer.
+      </p>
     </div>
   );
+
+  return (
+    <section className="space-y-4" aria-labelledby="revenue-chart-heading">
+      <h2 id="revenue-chart-heading" className="text-lg font-semibold">
+        Revenue
+      </h2>
+
+      {historyNotice}
+
+      {isLoading ? (
+        <LoadingBlock label="Loading charge history…" />
+      ) : anyError ? (
+        <ErrorState
+          title="Could not load revenue"
+          message={anyError instanceof Error ? anyError.message : String(anyError)}
+        />
+      ) : events.length === 0 || series.length === 0 ? (
+        <EmptyState
+          title="No charges in the available history"
+          description="No charge events were found in the recent ledger window. This does not necessarily mean there was no revenue — older history requires an indexer."
+        />
+      ) : (
+        <>
+          {/* Per-token totals — never combined across tokens. */}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {series.map((s) => (
+              <div
+                key={s.token.address}
+                className="rounded-md border border-gray-200 p-3"
+              >
+                <p className="text-xs uppercase tracking-wide text-gray-500">
+                  Total ({s.token.symbol})
+                </p>
+                <p className="mt-1 text-xl font-semibold">
+                  {formatAmount(s.total, s.token.decimals)} {s.token.symbol}
+                </p>
+                <p className="mt-1 text-xs text-gray-500">
+                  {s.token.decimals} decimals · {s.token.address.slice(0, 6)}…
+                  {s.token.address.slice(-4)}
+                </p>
+              </div>
+            ))}
+          </div>
+
+          <div className="h-72 w-full" aria-hidden="true">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="day" />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                {series.map((s) => (
+                  <Bar
+                    key={s.token.address}
+                    dataKey={s.token.address}
+                    name={s.token.symbol}
+                    fill={colorForToken(s.token.address)}
+                    stackId={undefined}
+                  />
+                ))}
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          {/* Accessible text/table alternative to the chart. */}
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <caption className="sr-only">
+                Charges per day, grouped by token. Amounts in different tokens are
+                never added together.
+              </caption>
+              <thead>
+                <tr className="border-b border-gray-200 text-left">
+                  <th scope="col" className="py-2 pr-4">
+                    Token
+                  </th>
+                  <th scope="col" className="py-2 pr-4">
+                    Day (UTC)
+                  </th>
+                  <th scope="col" className="py-2 pr-4">
+                    Amount
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {series.flatMap((s) =>
+                  s.buckets.map((b) => (
+                    <tr
+                      key={`${s.token.address}-${b.day}`}
+                      className="border-b border-gray-100"
+                    >
+                      <td className="py-2 pr-4">
+                        {s.token.symbol}{' '}
+                        <span className="text-xs text-gray-500">
+                          ({s.token.decimals} decimals)
+                        </span>
+                      </td>
+                      <td className="py-2 pr-4 font-mono">{b.day}</td>
+                      <td className="py-2 pr-4">
+                        {formatAmount(b.amount, s.token.decimals)} {s.token.symbol}
+                      </td>
+                    </tr>
+                  )),
+                )}
+              </tbody>
+              <tfoot>
+                {series.map((s) => (
+                  <tr key={`total-${s.token.address}`} className="font-semibold">
+                    <td className="py-2 pr-4" colSpan={2}>
+                      Total ({s.token.symbol})
+                    </td>
+                    <td className="py-2 pr-4">
+                      {formatAmount(s.total, s.token.decimals)} {s.token.symbol}
+                    </td>
+                  </tr>
+                ))}
+              </tfoot>
+            </table>
+          </div>
+
+          <p className="text-xs text-gray-500">
+            Charges shown are limited to the contract&apos;s cap and schedule; the
+            contract forbids charging more than the cap or off schedule.
+          </p>
+        </>
+      )}
+    </section>
+  );
 }
+
+function colorForToken(address: string): string {
+  const palette = [
+    '#2563eb',
+    '#16a34a',
+    '#d97706',
+    '#dc2626',
+    '#7c3aed',
+    '#0891b2',
+    '#db2777',
+    '#65a30d',
+  ];
+  let hash = 0;
+  for (let i = 0; i < address.length; i++) {
+    hash = (hash * 31 + address.charCodeAt(i)) >>> 0;
+  }
+  return palette[hash % palette.length];
+}
+
+export default RevenueChart;

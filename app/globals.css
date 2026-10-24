@@ -9,7 +9,7 @@
   --raised: 241 245 249;
   --line: 226 232 240;
   --fg: 15 23 42;
-  --muted: 100 116 139;
+  --muted: 71 85 105;
   --brand: 8 145 178;
   --brand-fg: 255 255 255;
   --ok: 5 150 105;
@@ -40,6 +40,22 @@ body {
   font-family: var(--font-sans);
 }
 
+/* Keyboard-only audit (#58): keep focus visible on every interactive element,
+   including links and custom controls that don't use the .btn/.input classes. */
+:focus-visible {
+  outline: 2px solid rgb(var(--brand));
+  outline-offset: 2px;
+}
+
+/* Skip link: hidden until focused, then jumps to main content. */
+.skip-link {
+  @apply sr-only;
+}
+.skip-link:focus,
+.skip-link:focus-visible {
+  @apply not-sr-only fixed left-4 top-4 z-50 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-brand-fg;
+}
+
 @layer components {
   .card {
     @apply rounded-xl border border-line bg-surface;
@@ -57,7 +73,7 @@ body {
     @apply btn border border-danger/40 bg-danger/10 text-danger hover:bg-danger/20;
   }
   .input {
-    @apply w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm text-fg placeholder:text-muted/70 focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand;
+    @apply w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm text-fg placeholder:text-muted focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand;
   }
   .label {
     @apply mb-1 block text-sm font-medium text-fg;

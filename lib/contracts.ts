@@ -84,15 +84,6 @@ export function nativeTokenId(network: Network): string {
 }
 
 // ---- error tables (codes are append-only in the contracts) ----
-//
-// Each table mirrors one contract's `#[contracterror]` enum by hand: the key is
-// the on-chain code (the `#N` in `Error(Contract, #N)`) and the value is the
-// sentence shown to the user. `explainError` looks codes up here, and a code
-// missing from its table falls back to a generic "error N" message.
-//
-// When a contract adds a code, add its row here in the same change. Every
-// message must stay truthful: a charge can never exceed the subscriber's cap
-// or happen off schedule, and the copy must say so.
 
 export const SUBSCRIPTION_ERRORS: ErrorTable = {
   1: "The subscription contract is already set up.",
@@ -303,20 +294,53 @@ export async function getRegistryStats(network: Network): Promise<RegistryStats>
 
 const tokenCache = new Map<string, Promise<TokenInfo>>();
 
-/** Symbol, name and decimals of a SEP-41 token. Cached per network+token. */
+/** A SEP-41 contract id: `C` followed by 55 base-32 characters. */
+const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
+/** True when `value` is shaped like a Stellar contract id. No network call. */
+export function isContractId(value: string): boolean {
+  return CONTRACT_ID_RE.test(value.trim());
+}
+
+/**
+ * Symbol, name and decimals of a SEP-41 token. Cached per network+token.
+ *
+ * Rejects before any network call when `token` isn't a contract id, and
+ * rejects with a `ContractError` when the contract can't be read (wrong
+ * address, not a SEP-41 token, or the node is unreachable).
+ */
 export function getTokenInfo(network: Network, token: string): Promise<TokenInfo> {
-  const key = `${network}:${token}`;
+  const contractId = token.trim();
+  if (!isContractId(contractId)) {
+    return Promise.reject(
+      new ContractError(
+        "That isn't a valid token contract id. Paste the C… address of a SEP-41 token.",
+        token,
+      ),
+    );
+  }
+  const key = `${network}:${contractId}`;
   let cached = tokenCache.get(key);
   if (!cached) {
     cached = (async () => {
-      const [symbol, name, decimals] = await Promise.all([
-        readContract<string>(network, token, "symbol", [], TOKEN_ERRORS),
-        readContract<string>(network, token, "name", [], TOKEN_ERRORS),
-        readContract<number>(network, token, "decimals", [], TOKEN_ERRORS),
-      ]);
+      let symbol: string;
+      let name: string;
+      let decimals: number;
+      try {
+        [symbol, name, decimals] = await Promise.all([
+          readContract<string>(network, contractId, "symbol", [], TOKEN_ERRORS),
+          readContract<string>(network, contractId, "name", [], TOKEN_ERRORS),
+          readContract<number>(network, contractId, "decimals", [], TOKEN_ERRORS),
+        ]);
+      } catch (err) {
+        throw new ContractError(
+          "This token couldn't be read. Check that the address is a SEP-41 token contract on this network.",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
       // The native asset's SAC reports "native"; people know it as XLM.
       const display = symbol === "native" ? "XLM" : symbol;
-      return { contractId: token, symbol: display, name, decimals: Number(decimals) };
+      return { contractId, symbol: display, name, decimals: Number(decimals) };
     })();
     cached.catch(() => tokenCache.delete(key));
     tokenCache.set(key, cached);
@@ -454,62 +478,10 @@ export async function createPlan(ctx: WriteCtx, input: CreatePlanInput): Promise
   return { ...result, id: toNumber(result.returnValue) };
 }
 
-// ---- plan input validation ----
-
-/** The contract's maximum plan name length, in UTF-8 bytes. */
-export const PLAN_NAME_MAX_BYTES = 64;
-
-export interface PlanInputErrors {
-  name?: string;
-  token?: string;
-  amountPerPeriod?: string;
-  intervalLedgers?: string;
-  defaultCap?: string;
-}
-
-/** UTF-8 byte length of a string, which is what the contract measures. */
-export function utf8ByteLength(value: string): number {
-  return new TextEncoder().encode(value).length;
-}
-
 /**
- * Check plan input against every rule the plan contract enforces, so the form
- * can show live errors and an invalid plan never reaches the wallet. Messages
- * match PLAN_ERRORS. Returns an object with one entry per invalid field; an
- * empty object means the input is valid.
+ * Close a plan to new subscribers. Existing subscriptions are untouched: they
+ * keep charging exactly as their subscribers authorized. This cannot be undone.
  */
-export function validatePlanInput(input: CreatePlanInput): PlanInputErrors {
-  const errors: PlanInputErrors = {};
-
-  const nameBytes = utf8ByteLength(input.name);
-  if (nameBytes < 1 || nameBytes > PLAN_NAME_MAX_BYTES) {
-    errors.name = PLAN_ERRORS[4];
-  }
-
-  if (!input.token) {
-    errors.token = "Choose the token subscribers will pay in.";
-  }
-
-  if (input.amountPerPeriod <= 0n) {
-    errors.amountPerPeriod = PLAN_ERRORS[5];
-  }
-
-  if (!Number.isInteger(input.intervalLedgers) || input.intervalLedgers < 1) {
-    errors.intervalLedgers = PLAN_ERRORS[6];
-  }
-
-  if (input.defaultCap < input.amountPerPeriod || input.defaultCap <= 0n) {
-    errors.defaultCap = PLAN_ERRORS[7];
-  }
-
-  return errors;
-}
-
-/** True when `validatePlanInput` reports no errors. */
-export function isPlanInputValid(input: CreatePlanInput): boolean {
-  return Object.keys(validatePlanInput(input)).length === 0;
-}
-
 export function deactivatePlan(ctx: WriteCtx, planId: number): Promise<TxResult> {
   return invokeContract(
     ctx,
